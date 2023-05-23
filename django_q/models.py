@@ -159,6 +159,36 @@ def validate_cron(value):
 def validate_kwarg(value):
     return value.isidentifier() and not iskeyword(value)
 
+def next_run_aligned(next_run: datetime, interval: timedelta) -> datetime:
+    """Returns the aligned next run.
+
+    The aligned next_run is the closest datetime which timestamp is multiple of interval.
+    Respect next_run TZ (returned datetime uses the same TZ).
+    """
+    next_run_tz = next_run.tzinfo
+    next_run_unix_epoch = int(next_run.timestamp())
+    interval_seconds = int(interval.total_seconds())
+    next_run_aligned_unix_epoch = round(next_run_unix_epoch/interval_seconds) * interval_seconds
+    return datetime.fromtimestamp(next_run_aligned_unix_epoch, next_run_tz)
+
+def alignment_correction(deviation: timedelta, rate: int) -> timedelta:
+    """Return a timedelta to correct the deviation at a given rate.
+
+    Given a deviation, this function return a timedelta to compensate that deviation
+    If we have a positive deviation, this function will return a negative deviation.
+    If we have a negative deviation, this function will return a positive deviation.
+
+    Example: if deviation=100 and rate=50, it will return -50.
+
+    If deviation is less than 1s, return 0.
+    """
+    reduced_deviation = deviation * rate * -1 / 100
+
+    if abs(reduced_deviation) < timedelta(seconds=1):
+        return timedelta(0)
+
+    return reduced_deviation
+
 
 class Schedule(models.Model):
     name = models.CharField(max_length=100, null=True, blank=True)
@@ -208,6 +238,19 @@ class Schedule(models.Model):
     )
     next_run = models.DateTimeField(
         verbose_name=_("Next Run"), default=timezone.now, null=True
+    )
+    alignment = models.BooleanField(
+        default=False,
+        help_text=_("If executions should be aligned with interval"),
+    )
+    alignment_rate = models.PositiveSmallIntegerField(
+        default=25,
+        help_text=_("The percetange rate at which the interval will be modified to achieve alignment."),
+    )
+    alignment_offset = models.DurationField(
+        null=True,
+        blank=True,
+        help_text=_("If alignment is enabled, offset of that alignment"),
     )
     cron = models.CharField(
         max_length=100,
@@ -261,6 +304,18 @@ class Schedule(models.Model):
 
         # add normal timedelta, we will correct this later based on timezone
         next_run += add
+
+        # If we have a desired alignment, we need adjust "add" to get closer to the desired alignment.
+        # This adjusment will be only +1 or -1 second.
+        if self.alignment:
+            # First get the ideal next run based on the desired alignment, period and next_run.
+            # This value could be bigger or smaller than the current next_run.
+            next_run_aligned_datetime = next_run_aligned(next_run, add)
+            if self.alignment_offset:
+                next_run_aligned_datetime += self.alignment_offset
+
+            # Now adjust next_run to get closer to the ideal next run.
+            next_run += alignment_correction(next_run - next_run_aligned_datetime, self.alignment_rate)
 
         # DST differencers don't matter with minutes, hourly or yearly, so skip those
         if self.schedule_type not in [self.MINUTES, self.HOURLY, self.YEARLY]:

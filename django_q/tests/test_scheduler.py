@@ -1,7 +1,11 @@
 import os
+import pytz
 from datetime import datetime, timedelta
 from multiprocessing import Event, Value
-from unittest import mock
+from unittest import mock, TestCase
+from dataclasses import dataclass
+from typing import List
+
 
 import pytest
 import django
@@ -17,6 +21,7 @@ from django_q.conf import Conf
 from django_q.queues import Queue
 from django_q.tasks import Schedule, fetch
 from django_q.tasks import schedule as create_schedule
+from django_q.models import next_run_aligned, alignment_correction
 from django_q.tests.settings import BASE_DIR
 from django_q.tests.testing_utilities.multiple_database_routers import (
     TestingMultipleAppsDatabaseRouter,
@@ -473,6 +478,109 @@ def test_scheduler_atomic_must_specify_the_database_based_on_router_redirection(
 
 def test_localtime():
     assert not is_naive(localtime())
+
+class TestSchedulerAlignedRun(TestCase):
+    def test_scheduler_aligned_run_same_tz(self):
+        """Returned value should have the same TZ as input next_run"""
+        next_run = datetime.fromtimestamp(10, pytz.utc)
+        interval = timedelta(seconds=10)
+        actual = next_run_aligned(next_run, interval)
+        expected = datetime.fromtimestamp(10, pytz.utc)
+        self.assertEqual(
+            expected,
+            actual,
+            "expected datetime does not match TZ",
+        )
+
+    def test_scheduler_aligned_run(self):
+        @dataclass
+        class TestCase:
+            name: str
+            next_run: datetime
+            interval: timedelta
+            expected: datetime
+
+        testcases = [
+            TestCase(
+                name="aligned next_run",
+                next_run=datetime.fromtimestamp(60),
+                interval=timedelta(minutes=1),
+                expected=datetime.fromtimestamp(60),
+            ),
+            TestCase(
+                name="not aligned next_run, too big",
+                next_run=datetime.fromtimestamp(61),
+                interval=timedelta(minutes=1),
+                expected=datetime.fromtimestamp(60),
+            ),
+            TestCase(
+                name="not aligned next_run, too small",
+                next_run=datetime.fromtimestamp(59),
+                interval=timedelta(minutes=1),
+                expected=datetime.fromtimestamp(60),
+            ),
+            TestCase(
+                name="aligned with bigger next_run value",
+                next_run=datetime.fromtimestamp(60*3+5),
+                interval=timedelta(minutes=1),
+                expected=datetime.fromtimestamp(60*3),
+            ),
+        ]
+
+        for case in testcases:
+            actual = next_run_aligned(case.next_run, case.interval)
+            self.assertEqual(
+                case.expected,
+                actual,
+                "failed test {} expected {}, actual {}".format(
+                    case.name, case.expected, actual
+                ),
+            )
+
+    def test_scheduler_aligned_correction(self):
+        @dataclass
+        class TestCase:
+            name: str
+            deviation: timedelta
+            rate: int
+            expected: timedelta
+
+        testcases = [
+            TestCase(
+                name="positive deviation with 50% rate",
+                deviation=timedelta(seconds=100),
+                rate=50,
+                expected=-timedelta(seconds=50),
+            ),
+            TestCase(
+                name="negative deviation with 50% rate",
+                deviation=-timedelta(seconds=100),
+                rate=50,
+                expected=timedelta(seconds=50),
+            ),
+            TestCase(
+                name="small positive deviation",
+                deviation=timedelta(milliseconds=500),
+                rate=10,
+                expected=timedelta(seconds=0),
+            ),
+            TestCase(
+                name="small negative deviation",
+                deviation=-timedelta(milliseconds=500),
+                rate=10,
+                expected=timedelta(seconds=0),
+            ),
+        ]
+
+        for case in testcases:
+            actual = alignment_correction(case.deviation, case.rate)
+            self.assertEqual(
+                case.expected,
+                actual,
+                "failed test {} expected {}, actual {}".format(
+                    case.name, case.expected, actual
+                ),
+            )
 
 
 @override_settings(USE_TZ=False)
